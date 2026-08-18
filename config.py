@@ -50,3 +50,9 @@ RUN_MODE = os.getenv("RUN_MODE", "monitor")
 MARKET_DATA_BUFFER_SIZE = 500
 WEBSOCKET_RECONNECT_INTERVAL = 5
 WEBSOCKET_PING_INTERVAL = 20
+
+# Live-trading safety gates – defaults to safe/off
+ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+ALLOWED_INST_ID = os.getenv("ALLOWED_INST_ID", "ROBO-USDT")
+OKX_HTTP_TIMEOUT = int(os.getenv("OKX_HTTP_TIMEOUT", "10"))
+OKX_ORDER_EXP_WINDOW_MS = int(os.getenv("OKX_ORDER_EXP_WINDOW_MS", "3000"))
