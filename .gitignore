@@ -1,0 +1,12 @@
+
+.env
+bot.out
+bot_state.json
+state.json
+logs/*.log
+
+.env
+bot.out
+bot_state.json
+state.json
+logs/*.log

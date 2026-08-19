@@ -41,9 +41,13 @@ from config import (
     MAX_CONSECUTIVE_LOSSES,
     MAX_TRADES_PER_DAY,
     COOLDOWN_MINUTES,
+    TELEGRAM_NOTIFY_ERRORS,
+    TELEGRAM_NOTIFY_SIGNALS,
+    TELEGRAM_NOTIFY_STARTUP,
 )
 from exchange_api import OKXApiError, OKXClient, OKXSafetyError
 from strategy import Candle, StrategyConfig, StrategyEngine
+from telegram_notifier import notify
 
 
 def setup_logger() -> logging.Logger:
@@ -199,8 +203,12 @@ class TradingBot:
                 TRADING_PAIR,
             )
             logger.info("OKX startup self-check passed: %s", result)
+            if TELEGRAM_NOTIFY_STARTUP:
+                notify(f"✅ OKX startup self-check passed\n{result}")
         except Exception as exc:
             logger.exception("OKX startup self-check failed: %s", exc)
+            if TELEGRAM_NOTIFY_ERRORS:
+                notify(f"❌ OKX startup self-check failed\n{exc}")
             raise
 
     async def handle_closed_1m_candle(self):
@@ -216,6 +224,14 @@ class TradingBot:
                 now=now,
             )
             logger.info("ENTRY signal=%s reason=%s meta=%s", signal.signal, signal.reason, signal.meta)
+            if TELEGRAM_NOTIFY_SIGNALS:
+                notify(
+                    f"📈 ENTRY signal\n"
+                    f"pair={TRADING_PAIR}\n"
+                    f"signal={signal.signal}\n"
+                    f"reason={signal.reason}\n"
+                    f"meta={signal.meta}"
+                )
 
             if signal.signal == "BUY":
                 await self.execute_buy(signal)
@@ -225,6 +241,14 @@ class TradingBot:
                 now=now,
             )
             logger.info("EXIT signal=%s reason=%s meta=%s", signal.signal, signal.reason, signal.meta)
+            if TELEGRAM_NOTIFY_SIGNALS:
+                notify(
+                    f"📉 EXIT signal\n"
+                    f"pair={TRADING_PAIR}\n"
+                    f"signal={signal.signal}\n"
+                    f"reason={signal.reason}\n"
+                    f"meta={signal.meta}"
+                )
 
             if signal.signal == "SELL":
                 await self.execute_sell(signal)
@@ -243,6 +267,16 @@ class TradingBot:
                 signal.take_profit_2 or 0.0,
             )
             self.engine.on_buy_filled(signal, datetime.now(timezone.utc))
+            if TELEGRAM_NOTIFY_SIGNALS:
+                notify(
+                    f"🟡 [MONITOR] BUY\n"
+                    f"pair={TRADING_PAIR}\n"
+                    f"qty={signal.quantity:.8f}\n"
+                    f"price={(signal.price or 0.0):.8f}\n"
+                    f"stop={(signal.stop_loss or 0.0):.8f}\n"
+                    f"tp1={(signal.take_profit_1 or 0.0):.8f}\n"
+                    f"tp2={(signal.take_profit_2 or 0.0):.8f}"
+                )
             return
 
         if RUN_MODE == "simulated_trade":
@@ -253,6 +287,13 @@ class TradingBot:
                 signal.price or 0.0,
             )
             self.engine.on_buy_filled(signal, datetime.now(timezone.utc))
+            if TELEGRAM_NOTIFY_SIGNALS:
+                notify(
+                    f"🟠 [SIMULATED] BUY\n"
+                    f"pair={TRADING_PAIR}\n"
+                    f"qty={signal.quantity:.8f}\n"
+                    f"price={(signal.price or 0.0):.8f}"
+                )
             return
 
         if RUN_MODE == "live_trade":
@@ -273,12 +314,24 @@ class TradingBot:
                         result,
                     )
                     self.engine.on_buy_filled(signal, datetime.now(timezone.utc))
+                    if TELEGRAM_NOTIFY_SIGNALS:
+                        notify(
+                            f"🟢 [LIVE] BUY SUCCESS\n"
+                            f"pair={TRADING_PAIR}\n"
+                            f"qty={signal.quantity:.8f}\n"
+                            f"price={(signal.price or 0.0):.8f}\n"
+                            f"result={result}"
+                        )
                     return
                 except (OKXApiError, OKXSafetyError) as exc:
                     logger.error("[LIVE] BUY FAILED %s", exc)
+                    if TELEGRAM_NOTIFY_ERRORS:
+                        notify(f"🔴 [LIVE] BUY FAILED\npair={TRADING_PAIR}\nerror={exc}")
                     return
                 except Exception as exc:
                     logger.exception("[LIVE] BUY UNKNOWN ERROR %s", exc)
+                    if TELEGRAM_NOTIFY_ERRORS:
+                        notify(f"🔥 [LIVE] BUY UNKNOWN ERROR\npair={TRADING_PAIR}\nerror={exc}")
                     return
 
         logger.error("未知 RUN_MODE=%s", RUN_MODE)
@@ -303,6 +356,14 @@ class TradingBot:
                 reason=signal.reason,
                 fill_time=datetime.now(timezone.utc),
             )
+            if TELEGRAM_NOTIFY_SIGNALS:
+                notify(
+                    f"🟡 [MONITOR] SELL\n"
+                    f"pair={TRADING_PAIR}\n"
+                    f"qty={signal.quantity:.8f}\n"
+                    f"price={sell_price:.8f}\n"
+                    f"reason={signal.reason}"
+                )
             return
 
         if RUN_MODE == "simulated_trade":
@@ -319,6 +380,14 @@ class TradingBot:
                 reason=signal.reason,
                 fill_time=datetime.now(timezone.utc),
             )
+            if TELEGRAM_NOTIFY_SIGNALS:
+                notify(
+                    f"🟠 [SIMULATED] SELL\n"
+                    f"pair={TRADING_PAIR}\n"
+                    f"qty={signal.quantity:.8f}\n"
+                    f"price={sell_price:.8f}\n"
+                    f"reason={signal.reason}"
+                )
             return
 
         if RUN_MODE == "live_trade":
@@ -345,12 +414,25 @@ class TradingBot:
                         reason=signal.reason,
                         fill_time=datetime.now(timezone.utc),
                     )
+                    if TELEGRAM_NOTIFY_SIGNALS:
+                        notify(
+                            f"🟢 [LIVE] SELL SUCCESS\n"
+                            f"pair={TRADING_PAIR}\n"
+                            f"qty={signal.quantity:.8f}\n"
+                            f"price={sell_price:.8f}\n"
+                            f"reason={signal.reason}\n"
+                            f"result={result}"
+                        )
                     return
                 except (OKXApiError, OKXSafetyError) as exc:
                     logger.error("[LIVE] SELL FAILED %s", exc)
+                    if TELEGRAM_NOTIFY_ERRORS:
+                        notify(f"🔴 [LIVE] SELL FAILED\npair={TRADING_PAIR}\nerror={exc}")
                     return
                 except Exception as exc:
                     logger.exception("[LIVE] SELL UNKNOWN ERROR %s", exc)
+                    if TELEGRAM_NOTIFY_ERRORS:
+                        notify(f"🔥 [LIVE] SELL UNKNOWN ERROR\npair={TRADING_PAIR}\nerror={exc}")
                     return
 
         logger.error("未知 RUN_MODE=%s", RUN_MODE)
@@ -369,6 +451,8 @@ class TradingBot:
         while True:
             try:
                 logger.info("连接 OKX Public WS: %s", OKX_PUBLIC_WS)
+                if TELEGRAM_NOTIFY_STARTUP:
+                    notify(f"🔌 Connecting OKX Public WS\n{OKX_PUBLIC_WS}")
                 async with websockets.connect(
                     OKX_PUBLIC_WS,
                     ping_interval=WEBSOCKET_PING_INTERVAL,
@@ -378,6 +462,8 @@ class TradingBot:
                 ) as ws:
                     await ws.send(json.dumps(sub_msg))
                     logger.info("已订阅 %s trades", TRADING_PAIR)
+                    if TELEGRAM_NOTIFY_STARTUP:
+                        notify(f"📡 已订阅 trades\npair={TRADING_PAIR}")
 
                     async for raw in ws:
                         try:
@@ -439,11 +525,15 @@ class TradingBot:
 
             except Exception as exc:
                 logger.exception("WebSocket 连接异常: %s", exc)
+                if TELEGRAM_NOTIFY_ERRORS:
+                    notify(f"⚠️ WebSocket 连接异常\nerror={exc}\n将在 {WEBSOCKET_RECONNECT_INTERVAL} 秒后重连")
                 logger.info("将在 %s 秒后重连...", WEBSOCKET_RECONNECT_INTERVAL)
                 await asyncio.sleep(WEBSOCKET_RECONNECT_INTERVAL)
 
     async def run(self):
         logger.info("Bot started | pair=%s | mode=%s | equity=%.2f", TRADING_PAIR, RUN_MODE, self.equity)
+        if TELEGRAM_NOTIFY_STARTUP:
+            notify(f"🤖 Bot started\npair={TRADING_PAIR}\nmode={RUN_MODE}\nequity={self.equity:.2f}")
         await self.startup_check()
         await self.consume_public_ws()
 

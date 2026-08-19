@@ -157,10 +157,19 @@ class OKXClient:
         else:
             resp = self._session.post(url, headers=headers, data=body_str, timeout=self._timeout)
 
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw_text": resp.text}
+
+        if resp.status_code >= 400:
+            raise OKXApiError(
+                f"HTTP {resp.status_code} for {method} {path} | response={data}"
+            )
+
         if data.get("code") != "0":
             raise OKXApiError(f"OKX {method} {path} error: {data}")
+
         return data
 
     # ------------------------------------------------------------------
