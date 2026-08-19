@@ -4,6 +4,7 @@ import logging
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Deque, List, Optional
 
@@ -11,43 +12,168 @@ import websockets
 
 from config import (
     ALLOWED_INST_ID,
+    COOLDOWN_MINUTES,
     ENABLE_LIVE_TRADING,
     INITIAL_EQUITY,
     LOG_FILE,
     LOG_LEVEL,
     MARKET_DATA_BUFFER_SIZE,
+    MAX_CONSECUTIVE_LOSSES,
+    MAX_DAILY_LOSS_PCT,
+    MAX_HOLDING_MINUTES,
+    MAX_POSITION_NOTIONAL_PCT,
+    MAX_TRADES_PER_DAY,
+    MIN_ORDER_NOTIONAL,
+    OKX_API_KEY,
+    OKX_PASSPHRASE,
+    OKX_PUBLIC_WS,
+    OKX_SECRET_KEY,
     OKX_HTTP_TIMEOUT,
     OKX_ORDER_EXP_WINDOW_MS,
-    OKX_PUBLIC_WS,
     RUN_MODE,
     STATE_FILE,
-    TRADING_PAIR,
-    USE_SIMULATED_TRADING,
-    WEBSOCKET_PING_INTERVAL,
-    WEBSOCKET_RECONNECT_INTERVAL,
-    TREND_FAST_MA,
-    TREND_SLOW_MA,
-    BREAKOUT_LOOKBACK,
-    VOLUME_LOOKBACK,
-    VOLUME_MULTIPLIER,
     STOP_LOSS_PCT,
     TAKE_PROFIT_1_PCT,
     TAKE_PROFIT_2_PCT,
-    MAX_HOLDING_MINUTES,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    TELEGRAM_ENABLED,
+    TRADING_PAIR,
+    TREND_FAST_MA,
+    TREND_SLOW_MA,
+    BREAKOUT_LOOKBACK,
+    USE_SIMULATED_TRADING,
+    VOLUME_LOOKBACK,
+    VOLUME_MULTIPLIER,
+    WEBSOCKET_PING_INTERVAL,
+    WEBSOCKET_RECONNECT_INTERVAL,
     RISK_PER_TRADE_PCT,
-    MAX_POSITION_NOTIONAL_PCT,
-    MIN_ORDER_NOTIONAL,
-    MAX_DAILY_LOSS_PCT,
-    MAX_CONSECUTIVE_LOSSES,
-    MAX_TRADES_PER_DAY,
-    COOLDOWN_MINUTES,
-    TELEGRAM_NOTIFY_ERRORS,
-    TELEGRAM_NOTIFY_SIGNALS,
-    TELEGRAM_NOTIFY_STARTUP,
 )
 from exchange_api import OKXApiError, OKXClient, OKXSafetyError
+from notification_service import (
+    notify_error,
+    notify_execution,
+    notify_heartbeat,
+    notify_market_data_timeout,
+    notify_signal,
+    notify_startup,
+    notify_startup_check_failed,
+    notify_startup_check_passed,
+    notify_subscription,
+    notify_ws_connecting,
+)
 from strategy import Candle, StrategyConfig, StrategyEngine
-from telegram_notifier import notify
+
+
+HEARTBEAT_INTERVAL_SECONDS = 1800
+MARKET_DATA_TIMEOUT_SECONDS = 120
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
+
+
+def validate_startup_config() -> None:
+    errors: list[str] = []
+
+    valid_modes = {"monitor", "simulated_trade", "live_trade"}
+    if RUN_MODE not in valid_modes:
+        errors.append(f"RUN_MODE 非法: {RUN_MODE}，必须是 {sorted(valid_modes)}")
+
+    if not TRADING_PAIR:
+        errors.append("TRADING_PAIR 不能为空")
+
+    if TELEGRAM_ENABLED:
+        if not TELEGRAM_BOT_TOKEN:
+            errors.append("TELEGRAM_ENABLED=true 时，TELEGRAM_BOT_TOKEN 不能为空")
+        if not TELEGRAM_CHAT_ID:
+            errors.append("TELEGRAM_ENABLED=true 时，TELEGRAM_CHAT_ID 不能为空")
+
+    if RUN_MODE == "live_trade":
+        if not ENABLE_LIVE_TRADING:
+            errors.append("RUN_MODE=live_trade 时，ENABLE_LIVE_TRADING 必须为 true")
+        if not OKX_API_KEY:
+            errors.append("RUN_MODE=live_trade 时，OKX_API_KEY 不能为空")
+        if not OKX_SECRET_KEY:
+            errors.append("RUN_MODE=live_trade 时，OKX_SECRET_KEY 不能为空")
+        if not OKX_PASSPHRASE:
+            errors.append("RUN_MODE=live_trade 时，OKX_PASSPHRASE 不能为空")
+
+    if ENABLE_LIVE_TRADING and RUN_MODE != "live_trade":
+        errors.append("ENABLE_LIVE_TRADING=true 但 RUN_MODE 不是 live_trade，配置存在冲突")
+
+    if INITIAL_EQUITY <= 0:
+        errors.append("INITIAL_EQUITY 必须大于 0")
+
+    if MARKET_DATA_BUFFER_SIZE <= 0:
+        errors.append("MARKET_DATA_BUFFER_SIZE 必须大于 0")
+
+    if WEBSOCKET_PING_INTERVAL <= 0:
+        errors.append("WEBSOCKET_PING_INTERVAL 必须大于 0")
+
+    if WEBSOCKET_RECONNECT_INTERVAL <= 0:
+        errors.append("WEBSOCKET_RECONNECT_INTERVAL 必须大于 0")
+
+    if TREND_FAST_MA <= 0 or TREND_SLOW_MA <= 0:
+        errors.append("TREND_FAST_MA / TREND_SLOW_MA 必须大于 0")
+
+    if TREND_FAST_MA >= TREND_SLOW_MA:
+        errors.append("TREND_FAST_MA 应小于 TREND_SLOW_MA")
+
+    if BREAKOUT_LOOKBACK <= 0:
+        errors.append("BREAKOUT_LOOKBACK 必须大于 0")
+
+    if VOLUME_LOOKBACK <= 0:
+        errors.append("VOLUME_LOOKBACK 必须大于 0")
+
+    if VOLUME_MULTIPLIER <= 0:
+        errors.append("VOLUME_MULTIPLIER 必须大于 0")
+
+    if STOP_LOSS_PCT <= 0:
+        errors.append("STOP_LOSS_PCT 必须大于 0")
+
+    if TAKE_PROFIT_1_PCT <= 0 or TAKE_PROFIT_2_PCT <= 0:
+        errors.append("TAKE_PROFIT_1_PCT / TAKE_PROFIT_2_PCT 必须大于 0")
+
+    if TAKE_PROFIT_1_PCT >= TAKE_PROFIT_2_PCT:
+        errors.append("TAKE_PROFIT_1_PCT 应小于 TAKE_PROFIT_2_PCT")
+
+    if MAX_HOLDING_MINUTES <= 0:
+        errors.append("MAX_HOLDING_MINUTES 必须大于 0")
+
+    if RISK_PER_TRADE_PCT <= 0:
+        errors.append("RISK_PER_TRADE_PCT 必须大于 0")
+
+    if MAX_POSITION_NOTIONAL_PCT <= 0:
+        errors.append("MAX_POSITION_NOTIONAL_PCT 必须大于 0")
+
+    if MIN_ORDER_NOTIONAL <= 0:
+        errors.append("MIN_ORDER_NOTIONAL 必须大于 0")
+
+    if MAX_DAILY_LOSS_PCT <= 0:
+        errors.append("MAX_DAILY_LOSS_PCT 必须大于 0")
+
+    if MAX_CONSECUTIVE_LOSSES <= 0:
+        errors.append("MAX_CONSECUTIVE_LOSSES 必须大于 0")
+
+    if MAX_TRADES_PER_DAY <= 0:
+        errors.append("MAX_TRADES_PER_DAY 必须大于 0")
+
+    if COOLDOWN_MINUTES < 0:
+        errors.append("COOLDOWN_MINUTES 不能小于 0")
+
+    if OKX_HTTP_TIMEOUT <= 0:
+        errors.append("OKX_HTTP_TIMEOUT 必须大于 0")
+
+    if OKX_ORDER_EXP_WINDOW_MS <= 0:
+        errors.append("OKX_ORDER_EXP_WINDOW_MS 必须大于 0")
+
+    if not OKX_PUBLIC_WS:
+        errors.append("OKX_PUBLIC_WS 不能为空")
+
+    if not ALLOWED_INST_ID:
+        errors.append("ALLOWED_INST_ID 不能为空")
+
+    if errors:
+        raise ValueError("启动配置校验失败:\n- " + "\n- ".join(errors))
 
 
 def setup_logger() -> logging.Logger:
@@ -57,11 +183,19 @@ def setup_logger() -> logging.Logger:
     if logger.handlers:
         return logger
 
+    log_path = Path(LOG_FILE)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     )
 
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     file_handler.setFormatter(formatter)
 
     console_handler = logging.StreamHandler()
@@ -196,6 +330,21 @@ class TradingBot:
             timeout=OKX_HTTP_TIMEOUT,
         )
 
+    def last_trade_time_str(self) -> str | None:
+        if self.market.last_ts is None:
+            return None
+        return self.market.last_ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    async def heartbeat_loop(self):
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            notify_heartbeat(
+                pair=TRADING_PAIR,
+                run_mode=RUN_MODE,
+                last_price=self.market.last_price,
+                last_trade_time=self.last_trade_time_str(),
+            )
+
     async def startup_check(self):
         try:
             result = await asyncio.to_thread(
@@ -203,12 +352,10 @@ class TradingBot:
                 TRADING_PAIR,
             )
             logger.info("OKX startup self-check passed: %s", result)
-            if TELEGRAM_NOTIFY_STARTUP:
-                notify(f"✅ OKX startup self-check passed\n{result}")
+            notify_startup_check_passed(TRADING_PAIR, result)
         except Exception as exc:
             logger.exception("OKX startup self-check failed: %s", exc)
-            if TELEGRAM_NOTIFY_ERRORS:
-                notify(f"❌ OKX startup self-check failed\n{exc}")
+            notify_startup_check_failed(TRADING_PAIR, str(exc))
             raise
 
     async def handle_closed_1m_candle(self):
@@ -224,14 +371,7 @@ class TradingBot:
                 now=now,
             )
             logger.info("ENTRY signal=%s reason=%s meta=%s", signal.signal, signal.reason, signal.meta)
-            if TELEGRAM_NOTIFY_SIGNALS:
-                notify(
-                    f"📈 ENTRY signal\n"
-                    f"pair={TRADING_PAIR}\n"
-                    f"signal={signal.signal}\n"
-                    f"reason={signal.reason}\n"
-                    f"meta={signal.meta}"
-                )
+            notify_signal(TRADING_PAIR, signal.signal, signal.reason, signal.meta, phase="entry")
 
             if signal.signal == "BUY":
                 await self.execute_buy(signal)
@@ -241,14 +381,7 @@ class TradingBot:
                 now=now,
             )
             logger.info("EXIT signal=%s reason=%s meta=%s", signal.signal, signal.reason, signal.meta)
-            if TELEGRAM_NOTIFY_SIGNALS:
-                notify(
-                    f"📉 EXIT signal\n"
-                    f"pair={TRADING_PAIR}\n"
-                    f"signal={signal.signal}\n"
-                    f"reason={signal.reason}\n"
-                    f"meta={signal.meta}"
-                )
+            notify_signal(TRADING_PAIR, signal.signal, signal.reason, signal.meta, phase="exit")
 
             if signal.signal == "SELL":
                 await self.execute_sell(signal)
@@ -267,16 +400,16 @@ class TradingBot:
                 signal.take_profit_2 or 0.0,
             )
             self.engine.on_buy_filled(signal, datetime.now(timezone.utc))
-            if TELEGRAM_NOTIFY_SIGNALS:
-                notify(
-                    f"🟡 [MONITOR] BUY\n"
-                    f"pair={TRADING_PAIR}\n"
-                    f"qty={signal.quantity:.8f}\n"
-                    f"price={(signal.price or 0.0):.8f}\n"
-                    f"stop={(signal.stop_loss or 0.0):.8f}\n"
-                    f"tp1={(signal.take_profit_1 or 0.0):.8f}\n"
-                    f"tp2={(signal.take_profit_2 or 0.0):.8f}"
-                )
+            notify_execution(
+                RUN_MODE,
+                "BUY",
+                TRADING_PAIR,
+                signal.quantity,
+                signal.price or 0.0,
+                stop_loss=signal.stop_loss or 0.0,
+                take_profit_1=signal.take_profit_1 or 0.0,
+                take_profit_2=signal.take_profit_2 or 0.0,
+            )
             return
 
         if RUN_MODE == "simulated_trade":
@@ -287,13 +420,13 @@ class TradingBot:
                 signal.price or 0.0,
             )
             self.engine.on_buy_filled(signal, datetime.now(timezone.utc))
-            if TELEGRAM_NOTIFY_SIGNALS:
-                notify(
-                    f"🟠 [SIMULATED] BUY\n"
-                    f"pair={TRADING_PAIR}\n"
-                    f"qty={signal.quantity:.8f}\n"
-                    f"price={(signal.price or 0.0):.8f}"
-                )
+            notify_execution(
+                RUN_MODE,
+                "BUY",
+                TRADING_PAIR,
+                signal.quantity,
+                signal.price or 0.0,
+            )
             return
 
         if RUN_MODE == "live_trade":
@@ -314,24 +447,22 @@ class TradingBot:
                         result,
                     )
                     self.engine.on_buy_filled(signal, datetime.now(timezone.utc))
-                    if TELEGRAM_NOTIFY_SIGNALS:
-                        notify(
-                            f"🟢 [LIVE] BUY SUCCESS\n"
-                            f"pair={TRADING_PAIR}\n"
-                            f"qty={signal.quantity:.8f}\n"
-                            f"price={(signal.price or 0.0):.8f}\n"
-                            f"result={result}"
-                        )
+                    notify_execution(
+                        RUN_MODE,
+                        "BUY",
+                        TRADING_PAIR,
+                        signal.quantity,
+                        signal.price or 0.0,
+                        result=str(result),
+                    )
                     return
                 except (OKXApiError, OKXSafetyError) as exc:
                     logger.error("[LIVE] BUY FAILED %s", exc)
-                    if TELEGRAM_NOTIFY_ERRORS:
-                        notify(f"🔴 [LIVE] BUY FAILED\npair={TRADING_PAIR}\nerror={exc}")
+                    notify_error("实盘买入", str(exc), pair=TRADING_PAIR)
                     return
                 except Exception as exc:
                     logger.exception("[LIVE] BUY UNKNOWN ERROR %s", exc)
-                    if TELEGRAM_NOTIFY_ERRORS:
-                        notify(f"🔥 [LIVE] BUY UNKNOWN ERROR\npair={TRADING_PAIR}\nerror={exc}")
+                    notify_error("实盘买入", str(exc), pair=TRADING_PAIR)
                     return
 
         logger.error("未知 RUN_MODE=%s", RUN_MODE)
@@ -356,14 +487,14 @@ class TradingBot:
                 reason=signal.reason,
                 fill_time=datetime.now(timezone.utc),
             )
-            if TELEGRAM_NOTIFY_SIGNALS:
-                notify(
-                    f"🟡 [MONITOR] SELL\n"
-                    f"pair={TRADING_PAIR}\n"
-                    f"qty={signal.quantity:.8f}\n"
-                    f"price={sell_price:.8f}\n"
-                    f"reason={signal.reason}"
-                )
+            notify_execution(
+                RUN_MODE,
+                "SELL",
+                TRADING_PAIR,
+                signal.quantity,
+                sell_price,
+                reason=signal.reason,
+            )
             return
 
         if RUN_MODE == "simulated_trade":
@@ -380,14 +511,14 @@ class TradingBot:
                 reason=signal.reason,
                 fill_time=datetime.now(timezone.utc),
             )
-            if TELEGRAM_NOTIFY_SIGNALS:
-                notify(
-                    f"🟠 [SIMULATED] SELL\n"
-                    f"pair={TRADING_PAIR}\n"
-                    f"qty={signal.quantity:.8f}\n"
-                    f"price={sell_price:.8f}\n"
-                    f"reason={signal.reason}"
-                )
+            notify_execution(
+                RUN_MODE,
+                "SELL",
+                TRADING_PAIR,
+                signal.quantity,
+                sell_price,
+                reason=signal.reason,
+            )
             return
 
         if RUN_MODE == "live_trade":
@@ -414,25 +545,23 @@ class TradingBot:
                         reason=signal.reason,
                         fill_time=datetime.now(timezone.utc),
                     )
-                    if TELEGRAM_NOTIFY_SIGNALS:
-                        notify(
-                            f"🟢 [LIVE] SELL SUCCESS\n"
-                            f"pair={TRADING_PAIR}\n"
-                            f"qty={signal.quantity:.8f}\n"
-                            f"price={sell_price:.8f}\n"
-                            f"reason={signal.reason}\n"
-                            f"result={result}"
-                        )
+                    notify_execution(
+                        RUN_MODE,
+                        "SELL",
+                        TRADING_PAIR,
+                        signal.quantity,
+                        sell_price,
+                        reason=signal.reason,
+                        result=str(result),
+                    )
                     return
                 except (OKXApiError, OKXSafetyError) as exc:
                     logger.error("[LIVE] SELL FAILED %s", exc)
-                    if TELEGRAM_NOTIFY_ERRORS:
-                        notify(f"🔴 [LIVE] SELL FAILED\npair={TRADING_PAIR}\nerror={exc}")
+                    notify_error("实盘卖出", str(exc), pair=TRADING_PAIR)
                     return
                 except Exception as exc:
                     logger.exception("[LIVE] SELL UNKNOWN ERROR %s", exc)
-                    if TELEGRAM_NOTIFY_ERRORS:
-                        notify(f"🔥 [LIVE] SELL UNKNOWN ERROR\npair={TRADING_PAIR}\nerror={exc}")
+                    notify_error("实盘卖出", str(exc), pair=TRADING_PAIR)
                     return
 
         logger.error("未知 RUN_MODE=%s", RUN_MODE)
@@ -451,8 +580,8 @@ class TradingBot:
         while True:
             try:
                 logger.info("连接 OKX Public WS: %s", OKX_PUBLIC_WS)
-                if TELEGRAM_NOTIFY_STARTUP:
-                    notify(f"🔌 Connecting OKX Public WS\n{OKX_PUBLIC_WS}")
+                notify_ws_connecting(OKX_PUBLIC_WS)
+
                 async with websockets.connect(
                     OKX_PUBLIC_WS,
                     ping_interval=WEBSOCKET_PING_INTERVAL,
@@ -462,10 +591,27 @@ class TradingBot:
                 ) as ws:
                     await ws.send(json.dumps(sub_msg))
                     logger.info("已订阅 %s trades", TRADING_PAIR)
-                    if TELEGRAM_NOTIFY_STARTUP:
-                        notify(f"📡 已订阅 trades\npair={TRADING_PAIR}")
+                    notify_subscription(TRADING_PAIR, "trades")
 
                     async for raw in ws:
+                        now_utc = datetime.now(timezone.utc)
+
+                        if self.market.last_ts is not None:
+                            idle_seconds = (now_utc - self.market.last_ts).total_seconds()
+                            if idle_seconds > MARKET_DATA_TIMEOUT_SECONDS:
+                                logger.warning(
+                                    "行情数据超时: idle_seconds=%.1f pair=%s",
+                                    idle_seconds,
+                                    TRADING_PAIR,
+                                )
+                                notify_market_data_timeout(
+                                    pair=TRADING_PAIR,
+                                    timeout_seconds=MARKET_DATA_TIMEOUT_SECONDS,
+                                    last_trade_time=self.last_trade_time_str(),
+                                )
+                                await ws.close()
+                                break
+
                         try:
                             msg = json.loads(raw)
                         except json.JSONDecodeError:
@@ -525,17 +671,26 @@ class TradingBot:
 
             except Exception as exc:
                 logger.exception("WebSocket 连接异常: %s", exc)
-                if TELEGRAM_NOTIFY_ERRORS:
-                    notify(f"⚠️ WebSocket 连接异常\nerror={exc}\n将在 {WEBSOCKET_RECONNECT_INTERVAL} 秒后重连")
+                notify_error(
+                    "OKX WebSocket",
+                    str(exc),
+                    action=f"将在 {WEBSOCKET_RECONNECT_INTERVAL} 秒后自动重连",
+                    pair=TRADING_PAIR,
+                    category="ws_reconnect",
+                )
                 logger.info("将在 %s 秒后重连...", WEBSOCKET_RECONNECT_INTERVAL)
                 await asyncio.sleep(WEBSOCKET_RECONNECT_INTERVAL)
 
     async def run(self):
+        validate_startup_config()
         logger.info("Bot started | pair=%s | mode=%s | equity=%.2f", TRADING_PAIR, RUN_MODE, self.equity)
-        if TELEGRAM_NOTIFY_STARTUP:
-            notify(f"🤖 Bot started\npair={TRADING_PAIR}\nmode={RUN_MODE}\nequity={self.equity:.2f}")
+        notify_startup(TRADING_PAIR, RUN_MODE, self.equity)
         await self.startup_check()
-        await self.consume_public_ws()
+        heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+        try:
+            await self.consume_public_ws()
+        finally:
+            heartbeat_task.cancel()
 
 
 async def main():
