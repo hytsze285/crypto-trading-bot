@@ -1,12 +1,7 @@
-
 .env
 bot.out
 bot_state.json
 state.json
 logs/*.log
-
-.env
-bot.out
-bot_state.json
-state.json
-logs/*.log
+__pycache__/
+*.pyc
